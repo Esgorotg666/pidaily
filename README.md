@@ -1,32 +1,61 @@
 # PiDaily
 
-Full daily utility app for Pi Network Pioneers.
+Full daily utility app for Pi Network Pioneers with multi-device sync via Supabase.
 
 ## Features
-- **Pi Authentication** — Login with your Pi identity inside Pi Browser
-- **Notes** — Free (5 notes) / Premium (50 notes), local storage
-- **Calculator** — Basic arithmetic
-- **Countdown Timer** — Quick focus timers (1, 5, 10, 15, 25 min)
-- **Daily Check-in** — Streak tracking
-- **Tip Jar** — Send any amount of π to support the app
-- **Premium Unlock** — 1 π one-time for higher limits
+- Pi Authentication (Pi Browser)
+- Notes (free 5 / premium 50) — synced
+- Calculator
+- Countdown Timer
+- Daily Check-in streak — synced
+- Tip Jar
+- Premium Unlock (1 π) — synced
 
-## Setup & Deploy
-1. Clone or import this repo into Vercel
-2. Add environment variable in Vercel:
-   - `PI_API_KEY` = your server API key from Pi Developer Portal
-3. Deploy
-4. In Pi Browser → Develop → register the app and set the URL to your Vercel deployment
-5. Open the Vercel URL **inside Pi Browser** to use it
+## Supabase Setup (one time)
 
-## Sandbox vs Production
-In `app/page.js`, the line:
-```js
-window.Pi.init({ version: '2.0', sandbox: true });
+1. Create a project at [supabase.com](https://supabase.com)
+2. Go to SQL Editor and run:
+
+```sql
+create table profiles (
+  pi_uid text primary key,
+  premium boolean default false,
+  streak int default 0,
+  last_checkin text,
+  created_at timestamptz default now()
+);
+
+create table notes (
+  id bigint generated always as identity primary key,
+  pi_uid text not null,
+  text text not null,
+  created_at timestamptz default now()
+);
+
+-- Simple open policies for the anon key (fine for early testing)
+alter table profiles enable row level security;
+alter table notes enable row level security;
+
+create policy "Allow all on profiles" on profiles for all using (true) with check (true);
+create policy "Allow all on notes" on notes for all using (true) with check (true);
 ```
-Set `sandbox: false` when you go live on Mainnet.
 
-## Notes
-- Premium status and notes are stored in localStorage (device-specific). For multi-device sync, add Supabase later.
-- Always test payments in sandbox first.
-- Incomplete payments are handled on next login.
+3. In Project Settings → API, copy:
+   - Project URL
+   - anon public key
+
+## Deploy
+
+1. Import this repo into Vercel
+2. Add these environment variables in Vercel:
+   - `PI_API_KEY` = your Pi server API key
+   - `NEXT_PUBLIC_SUPABASE_URL` = your Supabase project URL
+   - `NEXT_PUBLIC_SUPABASE_ANON_KEY` = your Supabase anon key
+3. Deploy
+4. Register the Vercel URL in Pi Developer Portal
+5. Open inside Pi Browser
+
+## Sandbox
+`app/page.js` currently has `sandbox: true`. Set to `false` for Mainnet.
+
+If Supabase env vars are missing, the app falls back to localStorage.

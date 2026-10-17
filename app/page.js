@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import { supabase } from '../lib/supabase';
 
 const FREE_NOTE_LIMIT = 5;
 const PREMIUM_NOTE_LIMIT = 50;
@@ -19,22 +20,13 @@ export default function Home() {
   const [tipAmount, setTipAmount] = useState('0.1');
   const [checkInStreak, setCheckInStreak] = useState(0);
   const [lastCheckIn, setLastCheckIn] = useState(null);
+  const [syncing, setSyncing] = useState(false);
 
   useEffect(() => {
     if (typeof window !== 'undefined' && window.Pi) {
       window.Pi.init({ version: '2.0', sandbox: true });
     }
-    const savedNotes = localStorage.getItem('pidaily_notes');
-    if (savedNotes) setNotes(JSON.parse(savedNotes));
-    const streak = localStorage.getItem('pidaily_streak');
-    const last = localStorage.getItem('pidaily_last_checkin');
-    if (streak) setCheckInStreak(parseInt(streak, 10));
-    if (last) setLastCheckIn(last);
   }, []);
-
-  useEffect(() => {
-    localStorage.setItem('pidaily_notes', JSON.stringify(notes));
-  }, [notes]);
 
   useEffect(() => {
     let timer;
@@ -46,6 +38,60 @@ export default function Home() {
     }
     return () => clearTimeout(timer);
   }, [countdown, countdownRunning]);
+
+  const loadUserData = async (piUid) => {
+    if (!supabase) {
+      // Fallback to localStorage
+      const saved = localStorage.getItem(`premium_${piUid}`);
+      if (saved === 'true') setPremium(true);
+      const savedNotes = localStorage.getItem('pidaily_notes');
+      if (savedNotes) setNotes(JSON.parse(savedNotes));
+      const streak = localStorage.getItem('pidaily_streak');
+      const last = localStorage.getItem('pidaily_last_checkin');
+      if (streak) setCheckInStreak(parseInt(streak, 10));
+      if (last) setLastCheckIn(last);
+      return;
+    }
+
+    setSyncing(true);
+    try {
+      // Load or create profile
+      let { data: profile } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('pi_uid', piUid)
+        .single();
+
+      if (!profile) {
+        const { data: newProfile } = await supabase
+          .from('profiles')
+          .insert({ pi_uid: piUid, premium: false, streak: 0, last_checkin: null })
+          .select()
+          .single();
+        profile = newProfile;
+      }
+
+      if (profile) {
+        setPremium(!!profile.premium);
+        setCheckInStreak(profile.streak || 0);
+        setLastCheckIn(profile.last_checkin);
+      }
+
+      // Load notes
+      const { data: noteRows } = await supabase
+        .from('notes')
+        .select('*')
+        .eq('pi_uid', piUid)
+        .order('created_at', { ascending: false });
+
+      if (noteRows) {
+        setNotes(noteRows.map((n) => ({ id: n.id, text: n.text, created: n.created_at })));
+      }
+    } catch (err) {
+      setStatus('Sync error: ' + err.message);
+    }
+    setSyncing(false);
+  };
 
   const authenticate = async () => {
     if (!window.Pi) {
@@ -65,8 +111,7 @@ export default function Home() {
       });
       setUser(auth.user);
       setStatus(`Logged in as ${auth.user.username}`);
-      const saved = localStorage.getItem(`premium_${auth.user.uid}`);
-      if (saved === 'true') setPremium(true);
+      await loadUserData(auth.user.uid);
     } catch (err) {
       setStatus('Auth failed: ' + (err.message || 'Unknown error'));
     }
@@ -103,10 +148,14 @@ export default function Home() {
   };
 
   const unlockPremium = () => {
-    createPayment(1, 'PiDaily Premium Unlock', { feature: 'premium_lifetime', user: user.uid }, () => {
+    createPayment(1, 'PiDaily Premium Unlock', { feature: 'premium_lifetime', user: user.uid }, async () => {
       setPremium(true);
-      localStorage.setItem(`premium_${user.uid}`, 'true');
-      setStatus('Premium unlocked! Enjoy the full tools.');
+      if (supabase) {
+        await supabase.from('profiles').update({ premium: true }).eq('pi_uid', user.uid);
+      } else {
+        localStorage.setItem(`premium_${user.uid}`, 'true');
+      }
+      setStatus('Premium unlocked! Syncs across devices.');
     });
   };
 
@@ -121,18 +170,35 @@ export default function Home() {
     });
   };
 
-  const addNote = () => {
-    if (!newNote.trim()) return;
+  const addNote = async () => {
+    if (!newNote.trim() || !user) return;
     const limit = premium ? PREMIUM_NOTE_LIMIT : FREE_NOTE_LIMIT;
     if (notes.length >= limit) {
       setStatus(premium ? 'Note limit reached' : 'Free limit reached — unlock Premium for more');
       return;
     }
-    setNotes([{ id: Date.now(), text: newNote.trim(), created: new Date().toISOString() }, ...notes]);
+
+    if (supabase) {
+      const { data, error } = await supabase
+        .from('notes')
+        .insert({ pi_uid: user.uid, text: newNote.trim() })
+        .select()
+        .single();
+      if (error) {
+        setStatus('Save failed: ' + error.message);
+        return;
+      }
+      setNotes([{ id: data.id, text: data.text, created: data.created_at }, ...notes]);
+    } else {
+      setNotes([{ id: Date.now(), text: newNote.trim(), created: new Date().toISOString() }, ...notes]);
+    }
     setNewNote('');
   };
 
-  const deleteNote = (id) => {
+  const deleteNote = async (id) => {
+    if (supabase && user) {
+      await supabase.from('notes').delete().eq('id', id).eq('pi_uid', user.uid);
+    }
     setNotes(notes.filter((n) => n.id !== id));
   };
 
@@ -158,19 +224,27 @@ export default function Home() {
     setCountdownRunning(true);
   };
 
-  const doCheckIn = () => {
+  const doCheckIn = async () => {
     const today = new Date().toDateString();
     if (lastCheckIn === today) {
       setStatus('Already checked in today');
       return;
     }
-    const newStreak = lastCheckIn && new Date(lastCheckIn).toDateString() === new Date(Date.now() - 86400000).toDateString()
-      ? checkInStreak + 1
-      : 1;
+    const yesterday = new Date(Date.now() - 86400000).toDateString();
+    const newStreak = lastCheckIn === yesterday ? checkInStreak + 1 : 1;
+
     setCheckInStreak(newStreak);
     setLastCheckIn(today);
-    localStorage.setItem('pidaily_streak', String(newStreak));
-    localStorage.setItem('pidaily_last_checkin', today);
+
+    if (supabase && user) {
+      await supabase
+        .from('profiles')
+        .update({ streak: newStreak, last_checkin: today })
+        .eq('pi_uid', user.uid);
+    } else {
+      localStorage.setItem('pidaily_streak', String(newStreak));
+      localStorage.setItem('pidaily_last_checkin', today);
+    }
     setStatus(`Checked in! Streak: ${newStreak}`);
   };
 
@@ -199,7 +273,9 @@ export default function Home() {
           <div style={{ background: '#1e293b', padding: '12px 16px', borderRadius: '12px', marginBottom: '16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <div>
               <strong>{user.username}</strong>
-              <div style={{ fontSize: '12px', color: '#94a3b8' }}>{premium ? 'Premium' : 'Free'}</div>
+              <div style={{ fontSize: '12px', color: '#94a3b8' }}>
+                {premium ? 'Premium' : 'Free'}{syncing ? ' • syncing' : ''}
+              </div>
             </div>
             {!premium && (
               <button onClick={unlockPremium} style={{ background: '#059669', color: 'white', border: 'none', borderRadius: '8px', padding: '8px 12px', fontSize: '14px', fontWeight: '600' }}>
@@ -235,7 +311,7 @@ export default function Home() {
                 />
                 <button onClick={addNote} style={{ background: '#7c3aed', color: 'white', border: 'none', borderRadius: '10px', padding: '0 16px' }}>Add</button>
               </div>
-              <p style={{ fontSize: '12px', color: '#64748b', margin: '0 0 8px' }}>{notes.length}/{noteLimit} notes</p>
+              <p style={{ fontSize: '12px', color: '#64748b', margin: '0 0 8px' }}>{notes.length}/{noteLimit} notes • syncs across devices</p>
               {notes.map((n) => (
                 <div key={n.id} style={{ background: '#1e293b', padding: '12px', borderRadius: '10px', marginBottom: '8px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                   <div style={{ flex: 1, wordBreak: 'break-word' }}>{n.text}</div>
@@ -275,7 +351,7 @@ export default function Home() {
           {tab === 'checkin' && (
             <div style={{ textAlign: 'center', background: '#1e293b', padding: '24px', borderRadius: '12px' }}>
               <div style={{ fontSize: '48px', fontWeight: '700', marginBottom: '8px' }}>{checkInStreak}</div>
-              <p style={{ color: '#94a3b8', margin: '0 0 16px' }}>day streak</p>
+              <p style={{ color: '#94a3b8', margin: '0 0 16px' }}>day streak • synced</p>
               <button onClick={doCheckIn} style={{ background: '#7c3aed', color: 'white', border: 'none', borderRadius: '12px', padding: '14px 32px', fontSize: '16px', fontWeight: '600' }}>
                 Check In Today
               </button>
