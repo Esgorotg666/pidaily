@@ -1,5 +1,5 @@
 export async function POST(req) {
-  const { paymentId, txid, uid } = await req.json();
+  const { paymentId, txid } = await req.json();
   const apiKey = process.env.PI_API_KEY;
 
   if (!apiKey) {
@@ -16,7 +16,6 @@ export async function POST(req) {
       body: JSON.stringify({ txid }),
     });
     const data = await res.json();
-
     return Response.json(data, { status: res.status });
   } catch (err) {
     return Response.json({ error: err.message }, { status: 500 });
